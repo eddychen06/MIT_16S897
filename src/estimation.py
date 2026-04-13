@@ -1,4 +1,35 @@
 import numpy as np
+from src.utils import hat
+
+H = np.vstack([np.zeros((1, 3)), np.eye(3)])
+T = np.diag([1.0, -1.0, -1.0, -1.0])
+
+
+def L(q):
+    s = q[0]
+    v = q[1:4]
+    M = np.empty((4, 4))
+    M[0, 0] = s
+    M[0, 1:] = -v
+    M[1:, 0] = v
+    M[1:, 1:] = s * np.eye(3) + hat(v)
+    return M
+
+
+def R(q):
+    s = q[0]
+    v = q[1:4]
+    M = np.empty((4, 4))
+    M[0, 0] = s
+    M[0, 1:] = -v
+    M[1:, 0] = v
+    M[1:, 1:] = s * np.eye(3) - hat(v)
+    return M
+
+
+def Q(q):
+    return H.T @ R(q).T @ L(q) @ H
+
 
 def solve_wahba_svd(weights, body_vectors, inertial_vectors):
     B = np.zeros((3, 3))
@@ -10,29 +41,18 @@ def solve_wahba_svd(weights, body_vectors, inertial_vectors):
     d = np.linalg.det(U) * np.linalg.det(Vt)
     M = np.diag([1, 1, d])
     
-    R = U @ M @ Vt
-    return R
-    
-def solve_wahba_q_method(weights, body_vectors, inertial_vectors):
-    B = np.zeros((3, 3))
+    R_opt = U @ M @ Vt
+    return R_opt
+
+
+def qmethod(weights, body_vectors, inertial_vectors):
+    D = np.zeros((4, 4))
     for w, r_B, r_N in zip(weights, body_vectors, inertial_vectors):
-        B += w * np.outer(r_B, r_N)
-    
-    S = B + B.T
-    z = np.array([B[2, 1] - B[1, 2],
-                  B[0, 2] - B[2, 0],
-                  B[1, 0] - B[0, 1]])
-    sigma = np.trace(B)
-    
-    K = np.zeros((4, 4))
-    K[0, 0] = sigma
-    K[0, 1:] = z
-    K[1:, 0] = z
-    K[1:, 1:] = S - np.eye(3) * sigma
-    
-    eigvals, eigvecs = np.linalg.eigh(K)
+        D += w * L(H @ r_N).T @ R(H @ r_B)
+
+    eigvals, eigvecs = np.linalg.eigh(D)
     q_opt = eigvecs[:, np.argmax(eigvals)]
-    
+
     return q_opt
 
 def triad(r1_B, r2_B, r1_N, r2_N):
