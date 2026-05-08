@@ -1,12 +1,6 @@
 import numpy as np
 from src.estimation import L
-
-
-def expq(phi):
-    theta = np.linalg.norm(phi)
-    if theta < 1e-14:
-        return np.array([1.0, 0.0, 0.0, 0.0])
-    return np.concatenate(([np.cos(theta)], phi * np.sinc(theta / np.pi)))
+from src.utils import expq
 
 
 class Sensor:

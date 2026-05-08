@@ -8,6 +8,37 @@ def hat(v):
         [-v[1], v[0],   0.0]
     ])
 
+
+def quat_left_matrix(q):
+    s = q[0]
+    v = q[1:4]
+    M = np.empty((4, 4))
+    M[0, 0] = s
+    M[0, 1:] = -v
+    M[1:, 0] = v
+    M[1:, 1:] = s * np.eye(3) + hat(v)
+    return M
+
+
+def quat_multiply(q1, q2):
+    return quat_left_matrix(q1) @ q2
+
+
+def expq(phi):
+    theta = np.linalg.norm(phi)
+    if theta < 1e-14:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    return np.concatenate(([np.cos(theta)], phi * np.sinc(theta / np.pi)))
+
+
+def quat_error(q, q_des):
+    q = q / np.linalg.norm(q)
+    q_des = q_des / np.linalg.norm(q_des)
+    dq = quat_left_matrix(q_des).T @ q
+    if dq[0] < 0.0:
+        dq = -dq
+    return dq / np.linalg.norm(dq)
+
 def rk4(func, y0, t_eval, args=()):
     N = len(t_eval)
     Y = np.zeros((N, len(y0)))
@@ -22,7 +53,7 @@ def rk4(func, y0, t_eval, args=()):
         k2 = func(t + 0.5 * dt, y_curr + 0.5 * dt * k1, *args)
         k3 = func(t + 0.5 * dt, y_curr + 0.5 * dt * k2, *args)
         k4 = func(t + dt, y_curr + dt * k3, *args)
-        
+
         Y[i+1] = y_curr + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
     
     return Y

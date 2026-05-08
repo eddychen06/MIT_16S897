@@ -1,4 +1,6 @@
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 from mpl_toolkits.mplot3d import Axes3D
@@ -217,3 +219,339 @@ def plot_mc_convergence(conv_results):
                  fontsize=14)
     plt.tight_layout()
     _save_fig(fig, "mekf_convergence.png")
+
+
+def _cumulative_trapezoid(y, x):
+    y = np.asarray(y)
+    x = np.asarray(x)
+    out = np.zeros_like(y)
+    if len(x) > 1:
+        dx = np.diff(x)
+        out[1:] = np.cumsum(0.5 * (y[1:] + y[:-1]) * dx[:, None], axis=0)
+    return out
+
+
+def plot_environmental_torques(t, T_orbit, gg_torque, drag_torque, combined_torque=None):
+    t_orbits = t / T_orbit
+    torque_cases = [
+        ("Gravity gradient", gg_torque),
+        ("Atmospheric drag", drag_torque),
+    ]
+    if combined_torque is not None:
+        torque_cases.append(("Combined", combined_torque))
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True)
+
+    floor = 1e-10
+    for name, torque in torque_cases:
+        norms = np.linalg.norm(torque, axis=1)
+        axes[0].semilogy(t_orbits, np.maximum(norms, floor), label=name)
+        mean_norm = np.trapezoid(norms, t) / (t[-1] - t[0])
+        axes[0].axhline(mean_norm, linewidth=0.8, linestyle='--', alpha=0.7,
+                        color=axes[0].lines[-1].get_color(),
+                        label=f'{name} mean')
+    axes[0].set_ylim(bottom=floor)
+    axes[0].set_ylabel('Torque magnitude (N m)')
+    axes[0].set_title('Environmental Torque History and Momentum Accumulation')
+    axes[0].grid(True, which='both')
+    axes[0].legend(ncol=2, fontsize=8, loc='lower right')
+
+    component_labels = [r'$\tau_x$', r'$\tau_y$', r'$\tau_z$']
+    for i, label in enumerate(component_labels):
+        axes[1].plot(t_orbits, gg_torque[:, i], label=label)
+        axes[2].plot(t_orbits, drag_torque[:, i], label=label)
+    axes[1].set_ylabel('GG torque (N m)')
+    axes[1].grid(True)
+    axes[1].legend(ncol=3, fontsize=8, loc='upper right')
+
+    axes[2].set_ylabel('Drag torque (N m)')
+    axes[2].grid(True)
+    axes[2].legend(ncol=3, fontsize=8, loc='upper right')
+
+    for name, torque in torque_cases:
+        delta_h = _cumulative_trapezoid(torque, t)
+        axes[3].plot(t_orbits, np.linalg.norm(delta_h, axis=1), label=name)
+    axes[3].set_xlabel('Time (orbits)')
+    axes[3].set_ylabel(r'$|\Delta H|$ (N m s)')
+    axes[3].grid(True)
+    axes[3].legend(loc='upper left')
+
+    plt.tight_layout()
+    _save_fig(fig, "environmental_torques.png")
+
+    labels = [name for name, _ in torque_cases]
+    mean_abs_day = []
+    net_day = []
+    mean_vectors = []
+    duration = t[-1] - t[0]
+    for _, torque in torque_cases:
+        norms = np.linalg.norm(torque, axis=1)
+        mean_norm = np.trapezoid(norms, t) / duration
+        mean_vec = np.trapezoid(torque, t, axis=0) / duration
+        mean_abs_day.append(mean_norm * 86400.0)
+        net_day.append(np.linalg.norm(mean_vec) * 86400.0)
+        mean_vectors.append(mean_vec)
+
+    x = np.arange(len(labels))
+    width = 0.36
+    mean_vectors = np.asarray(mean_vectors)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+    floor_h = 1e-7
+    scalar_plot = np.maximum(mean_abs_day, floor_h)
+    net_plot = np.maximum(net_day, floor_h)
+    axes[0].bar(x - width / 2, scalar_plot, width, label=r'$\int |\tau| dt$ per day')
+    axes[0].bar(x + width / 2, net_plot, width, label=r'$|\int \tau dt|$ per day')
+    axes[0].set_yscale('log')
+    axes[0].set_ylim(bottom=floor_h)
+    axes[0].axhline(1.5e-3, color='0.35', linewidth=0.8, linestyle=':', label='RW storage 1.5e-3')
+    for xi, val in zip(x - width / 2, mean_abs_day):
+        axes[0].text(xi, val * 1.15, f'{val:.2e}', ha='center', va='bottom', fontsize=8)
+    for xi, val in zip(x + width / 2, net_day):
+        axes[0].text(xi, max(val, floor_h) * 1.15, f'{val:.2e}', ha='center', va='bottom', fontsize=8)
+    axes[0].set_ylabel('Angular momentum (N m s/day)')
+    axes[0].set_title('Environmental Momentum Budget')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels)
+    axes[0].grid(True, axis='y', which='both')
+    axes[0].legend(loc='lower right', fontsize=9)
+
+    for i, label in enumerate(component_labels):
+        axes[1].bar(x + (i - 1) * width / 1.5, mean_vectors[:, i], width / 1.5, label=label)
+    linthresh = 1e-11
+    axes[1].set_yscale('symlog', linthresh=linthresh)
+    axes[1].axhline(0, color='0.5', linewidth=0.6)
+    axes[1].set_ylabel('Orbit-average torque (N m, symlog)')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels)
+    axes[1].grid(True, axis='y', which='both')
+    axes[1].legend(ncol=3, loc='upper right')
+
+    plt.tight_layout()
+    _save_fig(fig, "environmental_momentum_budget.png")
+
+
+def plot_environmental_response(t, T_orbit, case_solutions):
+    t_orbits = t / T_orbit
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    for name, sol in case_solutions.items():
+        omega_norm_rad = np.linalg.norm(sol[:, 4:7], axis=1)
+        cumulative_rad = np.zeros_like(omega_norm_rad)
+        if len(t) > 1:
+            cumulative_rad[1:] = np.cumsum(0.5 * (omega_norm_rad[1:] + omega_norm_rad[:-1]) * np.diff(t))
+        omega_norm_deg = np.degrees(omega_norm_rad)
+        axes[0].plot(t_orbits, np.degrees(cumulative_rad), label=name)
+        axes[1].plot(t_orbits, omega_norm_deg, label=name)
+
+    axes[0].set_ylabel(r'Cumulative rotation $\int|\vec{\omega}|\,dt$ (deg)')
+    axes[0].set_title('Uncontrolled Attitude Response to Environmental Torques')
+    axes[0].grid(True)
+    axes[0].legend(loc='upper left')
+
+    axes[1].set_xlabel('Time (orbits)')
+    axes[1].set_ylabel('Angular-rate norm (deg/s)')
+    axes[1].grid(True)
+    axes[1].legend(loc='upper left')
+
+    plt.tight_layout()
+    _save_fig(fig, "environmental_response.png")
+
+
+def plot_attitude_regulation(t, cases, basename, torque_limit=None, momentum_limit=None):
+    has_h = any("wheel_momentum" in v for v in cases.values())
+    n_panels = 4 if has_h else 3
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 3 * n_panels), sharex=True)
+
+    floor_att = 1e-3
+    for name, data in cases.items():
+        axes[0].semilogy(t, np.maximum(data["att_err_deg"], floor_att), label=name)
+        axes[1].plot(t, np.degrees(np.linalg.norm(data["omega"], axis=1)), label=name)
+        axes[2].plot(t, np.max(np.abs(data["torque"]), axis=1), label=name)
+        if has_h and "wheel_momentum" in data:
+            axes[3].plot(t, np.max(np.abs(data["wheel_momentum"]), axis=1), label=name)
+
+    axes[0].set_ylabel("Attitude error (deg)")
+    axes[0].set_title("TVLQR Attitude Regulation")
+    axes[0].grid(True, which='both')
+    axes[0].legend(loc='upper right')
+
+    axes[1].set_ylabel("Rate norm (deg/s)")
+    axes[1].grid(True)
+    axes[1].legend(loc='upper right')
+
+    if torque_limit is not None and torque_limit > 0.0:
+        axes[2].axhline(torque_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Cmd limit {torque_limit:.0e}')
+    axes[2].set_ylabel(r"$\max_i\,|\tau_i|$ (N m)")
+    axes[2].grid(True)
+    axes[2].legend(loc='upper right')
+
+    if has_h:
+        if momentum_limit is not None and momentum_limit > 0.0:
+            axes[3].axhline(momentum_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Storage {momentum_limit:.1e}')
+        axes[3].set_ylabel(r"$\max_i\,|h_{rw,i}|$ (N m s)")
+        axes[3].grid(True)
+        axes[3].legend(loc='upper right')
+
+    axes[-1].set_xlabel("Time (s)")
+
+    plt.tight_layout()
+    _save_fig(fig, basename)
+
+
+def plot_attitude_regulation_orbit(t, T_orbit, att_err_deg, torque, estimate_err_deg, basename, wheel_momentum=None, torque_limit=None, momentum_limit=None):
+    t_orbits = t / T_orbit
+    n_panels = 4 if wheel_momentum is not None else 3
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 3 * n_panels), sharex=True)
+
+    floor_att = 1e-3
+    axes[0].semilogy(t_orbits, np.maximum(att_err_deg, floor_att))
+    axes[0].set_ylabel("Pointing error (deg)")
+    axes[0].set_title("TVLQR Regulation with Disturbances and MEKF Estimates")
+    axes[0].grid(True, which='both')
+
+    axes[1].plot(t_orbits, np.max(np.abs(torque), axis=1))
+    if torque_limit is not None and torque_limit > 0.0:
+        axes[1].axhline(torque_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Cmd limit {torque_limit:.0e}')
+        axes[1].legend(loc='upper right')
+    axes[1].set_ylabel(r"$\max_i\,|\tau_i|$ (N m)")
+    axes[1].grid(True)
+
+    if wheel_momentum is not None:
+        component_labels = ['x', 'y', 'z']
+        component_colors = ['tab:blue', 'tab:orange', 'tab:green']
+        for i, (label, color) in enumerate(zip(component_labels, component_colors)):
+            axes[2].plot(t_orbits, wheel_momentum[:, i], color=color, label=fr'$h_{{rw,{label}}}$')
+        if momentum_limit is not None and momentum_limit > 0.0:
+            axes[2].axhline(momentum_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Storage $\\pm${momentum_limit:.1e}')
+            axes[2].axhline(-momentum_limit, color='0.35', linewidth=0.8, linestyle=':')
+        axes[2].set_ylabel("Wheel momentum (N m s)")
+        axes[2].grid(True)
+        axes[2].legend(ncol=4, fontsize=8, loc='upper right')
+
+    floor_mekf = 1e-3
+    axes[-1].semilogy(t_orbits, np.maximum(estimate_err_deg, floor_mekf))
+    axes[-1].set_xlabel("Time (orbits)")
+    axes[-1].set_ylabel("MEKF attitude error (deg)")
+    axes[-1].grid(True, which='both')
+
+    plt.tight_layout()
+    _save_fig(fig, basename)
+
+
+def plot_eigen_axis_slew(t, nominal, closed_loop, tracking_err_deg, torque_cmd, basename, torque_limit=None, wheel_momentum=None, momentum_limit=None):
+    fig, axes = plt.subplots(5, 1, figsize=(11, 14), sharex=True)
+
+    axes[0].plot(t, np.degrees(nominal["angle"]), label="Nominal")
+    axes[0].plot(t, np.degrees(closed_loop["angle"]), label="Closed-loop")
+    axes[0].set_ylabel("Slew angle (deg)")
+    axes[0].set_title("Eigen-Axis Slew Tracking")
+    axes[0].grid(True)
+    axes[0].legend(loc='lower right')
+
+    component_labels = ['x', 'y', 'z']
+    component_colors = ['tab:blue', 'tab:orange', 'tab:green']
+    omega_nom = np.degrees(nominal["omega"])
+    omega_cl = np.degrees(closed_loop["omega"])
+    for i, (label, color) in enumerate(zip(component_labels, component_colors)):
+        axes[1].plot(t, omega_nom[:, i], color=color, label=fr'$\omega_{label}$ nominal')
+        axes[1].plot(t, omega_cl[:, i], '--', color=color, alpha=0.7, label=fr'$\omega_{label}$ closed-loop')
+    axes[1].set_ylabel("Body rate (deg/s)")
+    axes[1].grid(True)
+    axes[1].legend(ncol=3, fontsize=8, loc='upper right')
+
+    for i, (label, color) in enumerate(zip(component_labels, component_colors)):
+        axes[2].plot(t, nominal["torque"][:, i], color=color, label=fr'$\tau_{label}$ nominal')
+        axes[2].plot(t, torque_cmd[:, i], '--', color=color, alpha=0.7, label=fr'$\tau_{label}$ commanded')
+    cmd_max = float(np.max(np.abs(torque_cmd))) if torque_cmd.size else 0.0
+    nom_max = float(np.max(np.abs(nominal["torque"]))) if nominal["torque"].size else 0.0
+    data_max = max(cmd_max, nom_max)
+    if data_max > 0.0:
+        axes[2].set_ylim(-1.4 * data_max, 1.4 * data_max)
+    if torque_limit is not None and torque_limit > 0.0:
+        axes[2].axhline(torque_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Cmd limit $\\pm${torque_limit:.0e}')
+        axes[2].axhline(-torque_limit, color='0.35', linewidth=0.8, linestyle=':')
+    axes[2].set_ylabel("Torque (N m)")
+    axes[2].grid(True)
+    axes[2].legend(ncol=3, fontsize=8, loc='upper right')
+
+    if wheel_momentum is not None:
+        for i, (label, color) in enumerate(zip(component_labels, component_colors)):
+            axes[3].plot(t, wheel_momentum[:, i], color=color, label=fr'$h_{{rw,{label}}}$')
+        if momentum_limit is not None and momentum_limit > 0.0:
+            axes[3].axhline(momentum_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Storage $\\pm${momentum_limit:.1e}')
+            axes[3].axhline(-momentum_limit, color='0.35', linewidth=0.8, linestyle=':')
+        axes[3].set_ylabel("Wheel momentum (N m s)")
+        axes[3].grid(True)
+        axes[3].legend(ncol=4, fontsize=8, loc='upper right')
+    else:
+        axes[3].set_visible(False)
+
+    err_floor = max(1e-3, 0.5 * float(np.min(tracking_err_deg[tracking_err_deg > 0])) if np.any(tracking_err_deg > 0) else 1e-3)
+    axes[4].semilogy(t, np.maximum(tracking_err_deg, err_floor))
+    axes[4].set_xlabel("Time (s)")
+    axes[4].set_ylabel("Tracking error (deg)")
+    axes[4].grid(True, which='both')
+
+    plt.tight_layout()
+    _save_fig(fig, basename)
+
+
+def plot_versine_profile(t, nominal, basename, maneuver_time=None):
+    angle_deg = np.degrees(nominal["angle"])
+    omega_norm = np.degrees(np.linalg.norm(nominal["omega"], axis=1))
+    alpha_norm = np.degrees(np.linalg.norm(nominal["alpha"], axis=1))
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    axes[0].plot(t, angle_deg)
+    axes[0].set_ylabel(r"$\theta$ (deg)")
+    axes[0].set_title("Position-Versine Reference Profile")
+    axes[0].grid(True)
+
+    axes[1].plot(t, omega_norm)
+    axes[1].set_ylabel(r"$\dot\theta$ (deg/s)")
+    axes[1].grid(True)
+
+    axes[2].plot(t, alpha_norm)
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_ylabel(r"$|\ddot\theta|$ (deg/s$^2$)")
+    axes[2].grid(True)
+
+    if maneuver_time is not None:
+        for ax in axes:
+            ax.axvline(maneuver_time, color='0.5', linewidth=0.8, linestyle='--')
+
+    plt.tight_layout()
+    _save_fig(fig, basename)
+
+
+def plot_slew_vs_regulator(t, slew, regulator, basename, torque_limit=None, momentum_limit=None):
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+
+    axes[0].plot(t, slew["att_err_deg"], label="Eigen-axis slew", color='tab:blue')
+    axes[0].plot(t, regulator["att_err_deg"], label="Regulator", color='tab:red')
+    axes[0].set_ylabel("Attitude error (deg)")
+    axes[0].set_title(r"$180^\circ$ Maneuver: Eigen-Axis Slew vs. Regulator")
+    axes[0].grid(True)
+    axes[0].legend(loc='upper right')
+
+    axes[1].plot(t, np.max(np.abs(slew["torque"]), axis=1), label="Eigen-axis slew", color='tab:blue')
+    axes[1].plot(t, np.max(np.abs(regulator["torque"]), axis=1), label="Regulator", color='tab:red')
+    if torque_limit is not None and torque_limit > 0.0:
+        axes[1].axhline(torque_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Cmd limit {torque_limit:.0e}')
+    axes[1].set_ylabel(r"$\max_i\,|\tau_i|$ (N m)")
+    axes[1].grid(True)
+    axes[1].legend(loc='upper right')
+
+    slew_h = np.max(np.abs(slew["wheel_momentum"]), axis=1)
+    reg_h = np.max(np.abs(regulator["wheel_momentum"]), axis=1)
+    axes[2].plot(t, slew_h, label="Eigen-axis slew", color='tab:blue')
+    axes[2].plot(t, reg_h, label="Regulator", color='tab:red')
+    if momentum_limit is not None and momentum_limit > 0.0:
+        axes[2].axhline(momentum_limit, color='0.35', linewidth=0.8, linestyle=':', label=f'Storage {momentum_limit:.1e}')
+    axes[2].set_xlabel("Time (s)")
+    axes[2].set_ylabel(r"$\max_i\,|h_{rw,i}|$ (N m s)")
+    axes[2].grid(True)
+    axes[2].legend(loc='upper right')
+
+    plt.tight_layout()
+    _save_fig(fig, basename)

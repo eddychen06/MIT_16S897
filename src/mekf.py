@@ -1,6 +1,6 @@
 import numpy as np
 from src.estimation import L, R, Q, H, T
-from src.sensors import expq
+from src.utils import expq
 
 
 def _G(q):
