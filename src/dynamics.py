@@ -40,8 +40,7 @@ def full_dyn(t, x, J, mu):
     dq = quaternion_kinematics(q / np.linalg.norm(q), w)
     dp = np.zeros(3)
     I_inv = np.linalg.inv(J)
-    dw = I_inv @ (-dp - np.cross(w, J @ w + p)) 
-
+    dw = I_inv @ (-dp - np.cross(w, J @ w + p))
 
     return np.concatenate((dq, dw, dp, dr, dv))
 
@@ -130,7 +129,9 @@ def full_dyn_env(t, x, J, mu, surfaces, env):
     return np.concatenate((dq, dw, dp, dr, dv))
 
 
-def full_dyn_controlled(t, x, J, mu, surfaces, env, tau_cmd):
+def full_dyn_controlled(t, x, J, mu, surfaces, env, tau_cmd, tau_ext=None):
+    if tau_ext is None:
+        tau_ext = np.zeros(3)
     q = x[0:4]
     w = x[4:7]
     p = x[7:10]
@@ -155,6 +156,6 @@ def full_dyn_controlled(t, x, J, mu, surfaces, env, tau_cmd):
         cd=env.get("cd", 2.2),
     )
     I_inv = np.linalg.inv(J)
-    dw = I_inv @ (tau_env - dp - np.cross(w, J @ w + p))
+    dw = I_inv @ (tau_env + tau_ext - dp - np.cross(w, J @ w + p))
 
     return np.concatenate((dq, dw, dp, dr, dv))

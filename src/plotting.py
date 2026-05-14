@@ -555,3 +555,97 @@ def plot_slew_vs_regulator(t, slew, regulator, basename, torque_limit=None, mome
 
     plt.tight_layout()
     _save_fig(fig, basename)
+
+
+def plot_mtq_only_slew(t, T_orbit, state, moment, diag, m_max, basename,
+                       commanded_angle_deg, title_suffix=""):
+    """Magnetic-only slew figure (HW5 brief Figure 2).
+
+    Layout per the brief:
+      A) attitude error to final attitude (linear y-axis when error oscillates 5-30 deg)
+      B) body-rate norm vs time in orbits (replaces 'slew progress', which the brief
+         flagged as misleading: motion in the wrong direction still looks like progress)
+      C) max_i |m_i| / m_max vs time in orbits
+      D) ||tau_des||, ||tau_MTQ||, ||tau_lost|| vs time in orbits, where
+         tau_lost = (Bhat Bhat^T) tau_des = tau_des - tau_MTQ
+    """
+    t_orbits = t / T_orbit
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7.5))
+    axA, axB = axes[0]
+    axC, axD = axes[1]
+
+    err = diag["att_err_to_final_deg"]
+    axA.plot(t_orbits, err, color='tab:red')
+    axA.axhline(5.0, color='0.4', linewidth=0.6, linestyle=':',  alpha=0.7, label=r"$5^\circ$")
+    axA.axhline(1.0, color='0.4', linewidth=0.6, linestyle='--', alpha=0.7, label=r"$1^\circ$")
+    axA.set_xlabel("Time (orbits)")
+    axA.set_ylabel(r"$\angle(q,q_f)$ (deg)")
+    axA.set_ylim(0, max(commanded_angle_deg * 1.1, float(np.max(err)) * 1.05, 1.0))
+    axA.set_title(f"A) Error to commanded final attitude ({commanded_angle_deg:.0f}\u00b0 about $\\hat{{n}}$)")
+    axA.grid(True, alpha=0.6)
+    axA.legend(loc='upper right', fontsize=8)
+
+    omega = state[:, 4:7]
+    omega_norm_deg = np.degrees(np.linalg.norm(omega, axis=1))
+    axB.plot(t_orbits, omega_norm_deg, color='tab:red')
+    axB.set_xlabel("Time (orbits)")
+    axB.set_ylabel(r"$\|\omega\|$ (deg/s)")
+    peak_w = float(np.max(omega_norm_deg))
+    axB.set_title(f"B) Body-rate norm (peak {peak_w:.3f} deg/s)")
+    axB.grid(True, alpha=0.6)
+
+    sat = np.max(np.abs(moment), axis=1) / m_max
+    axC.plot(t_orbits, sat, color='tab:red')
+    axC.axhline(1.0, color='0.35', linewidth=0.8, linestyle=':')
+    peak_sat = float(np.max(sat))
+    axC.set_xlabel("Time (orbits)")
+    axC.set_ylabel(r"$\max_i |m_{c,i}| / m_{\max}$")
+    axC.set_ylim(0, max(1.1, peak_sat * 1.1))
+    axC.set_title(f"C) Dipole saturation fraction (peak {peak_sat*100:.1f}%)")
+    axC.grid(True, alpha=0.6)
+
+    tau_eps = 1e-12
+    axD.semilogy(t_orbits, np.maximum(diag["tau_des_norm"], tau_eps),
+                 color='tab:blue', linewidth=1.4, label=r"$\|\tau_{des}\|$")
+    axD.semilogy(t_orbits, np.maximum(diag["tau_actual_norm"], tau_eps),
+                 color='tab:red', linewidth=1.4, label=r"$\|\tau_{MTQ}\|$")
+    axD.semilogy(t_orbits, np.maximum(diag["tau_lost_norm"], tau_eps),
+                 color='tab:purple', linewidth=1.0, linestyle='--',
+                 label=r"$\|\tau_{lost}\|$")
+    tau_top = float(np.nanmax(diag["tau_des_norm"]))
+    axD.set_ylim(1e-11, max(tau_top * 3.0, 1e-6))
+    axD.set_xlabel("Time (orbits)")
+    axD.set_ylabel("Torque (N m)")
+    axD.set_title(r"D) Torque budget: $\|\tau_{des}\|,\;\|\tau_{MTQ}\|,\;\|\tau_{lost}\|$")
+    axD.grid(True, which='both', alpha=0.6)
+    axD.legend(loc='upper right', fontsize=9)
+
+    fig.suptitle(f"MTQ-Only 3-Axis Slew{title_suffix}", fontsize=11)
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    _save_fig(fig, basename)
+
+
+def plot_rw_vs_mtq_control(T_orbit, rw, mtq, basename):
+    """Report-facing RW vs MTQ comparison: attitude-error trajectories only.
+
+    Each input dict must have keys `t`, `att_err_deg`, and `label`.
+    """
+    fig, ax = plt.subplots(figsize=(10.5, 6.0))
+    floor = 1e-3
+    ax.semilogy(rw["t"] / T_orbit, np.maximum(rw["att_err_deg"], floor),
+                color='tab:blue', linewidth=1.8, label=rw["label"])
+    ax.semilogy(mtq["t"] / T_orbit, np.maximum(mtq["att_err_deg"], floor),
+                color='tab:red', linewidth=1.8, label=mtq["label"])
+    ax.axhline(5.0, color='0.4', linewidth=0.7, linestyle=':',  alpha=0.8,
+               label=r"$5^\circ$")
+    ax.axhline(1.0, color='0.4', linewidth=0.7, linestyle='--', alpha=0.8,
+               label=r"$1^\circ$")
+    ax.set_xlabel("Time (orbits)")
+    ax.set_ylabel("Attitude error (deg)")
+    ax.set_title("Reaction-Wheel vs. Magnetorquer-Only Slew Tracking")
+    ax.grid(True, which='both', alpha=0.6)
+    ax.legend(loc='upper right', fontsize=9)
+
+    plt.tight_layout()
+    _save_fig(fig, basename)
+

@@ -164,3 +164,88 @@ class TVLQRAttitudeRegulator:
             tau = np.clip(tau, -self.torque_limit, self.torque_limit)
 
         return tau
+
+
+class MagneticProjectedTorqueController:
+    """Magnetic-only 3-axis attitude controller (HW5 option 5).
+
+    Implements a nonlinear PD on quaternion error followed by projection of the
+    desired body torque into the rank-2 magnetic-actuator subspace:
+
+        tau_des = -Kp * dq_v - Kd * (omega - omega_des)
+        m_c     = (B_body x tau_des) / ||B_body||^2          (clipped per axis)
+        tau_MTQ = m_c x B_body = (I - Bhat Bhat^T) tau_des
+
+    Here dq_v = quat_error(q, q_des)[1:4] = sin(theta/2) * axis pointing from
+    q_des to q. The torque parallel to B_body is unrealizable instantaneously;
+    full 3-axis control emerges only as the orbit sweeps Bhat through different
+    directions.
+    """
+
+    def __init__(self, Kp, Kd, m_max, tau_des_limit=None):
+        # Kp, Kd: scalar (uniform) or length-3 vector (per-axis). When the
+        # spacecraft has anisotropic inertia (e.g. a 3U CubeSat where one body
+        # axis -- the long axis -- has much smaller moment of inertia than the
+        # other two), a scalar Kp gives that axis a much higher natural
+        # frequency than the others, which aliases against the orbital sweep
+        # of B and destabilises the closed loop. Using
+        # Kp_axis = omega_n^2 * I_axis (and analogously for Kd) holds the
+        # natural frequency uniform across all three body axes.
+        self.Kp = np.atleast_1d(np.asarray(Kp, dtype=float))
+        self.Kd = np.atleast_1d(np.asarray(Kd, dtype=float))
+        if self.Kp.size == 1:
+            self.Kp = np.full(3, float(self.Kp[0]))
+        if self.Kd.size == 1:
+            self.Kd = np.full(3, float(self.Kd[0]))
+        if self.Kp.shape != (3,) or self.Kd.shape != (3,):
+            raise ValueError("Kp and Kd must be scalar or length-3 vector")
+        self.m_max = float(m_max)
+        self.tau_des_limit = (None if tau_des_limit is None
+                              else np.atleast_1d(np.asarray(tau_des_limit, dtype=float)))
+        if self.tau_des_limit is not None and self.tau_des_limit.size == 1:
+            self.tau_des_limit = np.full(3, float(self.tau_des_limit[0]))
+
+    def desired_torque(self, q, omega, q_des, omega_des=None):
+        if omega_des is None:
+            omega_des = np.zeros(3)
+        dq = quat_error(q, q_des)
+        dq_v = dq[1:4]
+        tau_des = -self.Kp * dq_v - self.Kd * (np.asarray(omega) - np.asarray(omega_des))
+        if self.tau_des_limit is not None:
+            tau_des = np.clip(tau_des, -self.tau_des_limit, self.tau_des_limit)
+        return tau_des
+
+    def step(self, q, omega, q_des, B_body, omega_des=None):
+        tau_des = self.desired_torque(q, omega, q_des, omega_des)
+        B = np.asarray(B_body, dtype=float)
+        B2 = float(np.dot(B, B))
+        if B2 < 1e-20:
+            m_cmd = np.zeros(3)
+        else:
+            m_cmd = np.cross(B, tau_des) / B2
+        m_cmd = np.clip(m_cmd, -self.m_max, self.m_max)
+        tau_actual = np.cross(m_cmd, B)
+        tau_lost = tau_des - tau_actual
+        tau_des_norm = float(np.linalg.norm(tau_des))
+        tau_actual_norm = float(np.linalg.norm(tau_actual))
+        if B2 > 0.0 and tau_des_norm > 0.0:
+            Bhat = B / np.sqrt(B2)
+            parallel_loss = abs(float(np.dot(tau_des, Bhat))) / tau_des_norm
+            proj_eff = tau_actual_norm / tau_des_norm
+        else:
+            parallel_loss = 0.0
+            proj_eff = 0.0
+        return {
+            "m_cmd": m_cmd,
+            "tau_des": tau_des,
+            "tau_actual": tau_actual,
+            "tau_lost": tau_lost,
+            "tau_des_norm": tau_des_norm,
+            "tau_actual_norm": tau_actual_norm,
+            "parallel_loss_fraction": parallel_loss,
+            "projection_efficiency": proj_eff,
+            "dipole_fraction": float(np.max(np.abs(m_cmd)) / self.m_max),
+        }
+
+    def moment(self, q, omega, q_des, B_body, omega_des=None):
+        return self.step(q, omega, q_des, B_body, omega_des)["m_cmd"]

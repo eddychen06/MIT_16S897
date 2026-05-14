@@ -2,11 +2,21 @@ import numpy as np
 from src.utils import rk4, box_inertia, parallel_axis_theorem, perturb_inertia, hat, expq, quat_error
 from src.dynamics import orbit_dyn, attitude_dyn, full_dyn, full_dyn_env, full_dyn_controlled, gravity_gradient_torque, drag_torque, quaternion_to_matrix
 from src.spacecraft import Spacecraft
-from src.plotting import plot_orbit, plot_attitude_stability, plot_momentum_sphere, plot_full_dyn, plot_environmental_torques, plot_environmental_response, plot_attitude_regulation, plot_attitude_regulation_orbit, plot_eigen_axis_slew, plot_mekf_errors, plot_mc_attitude_errors, plot_mc_convergence, plot_versine_profile, plot_slew_vs_regulator
+from src.plotting import (
+    plot_orbit, plot_attitude_stability, plot_momentum_sphere, plot_full_dyn,
+    plot_environmental_torques, plot_environmental_response, plot_attitude_regulation,
+    plot_attitude_regulation_orbit, plot_eigen_axis_slew, plot_mekf_errors,
+    plot_mc_attitude_errors, plot_mc_convergence, plot_versine_profile,
+    plot_slew_vs_regulator, plot_mtq_only_slew, plot_rw_vs_mtq_control,
+)
 from src.sensors import Sensor, VectorSensor, StarTracker, Gyroscope
 from src.estimation import solve_wahba_svd, qmethod, triad, Q, L as L_q
 from src.mekf import MEKF
-from src.control import TVLQRAttitudeRegulator, attitude_error_state, eigen_axis_slew_trajectory
+from src.control import (
+    TVLQRAttitudeRegulator, attitude_error_state, eigen_axis_slew_trajectory,
+    MagneticProjectedTorqueController,
+)
+from src.magnetic import B_body, B_eci, full_dyn_magnetic
 import time
 import copy
 
@@ -28,7 +38,7 @@ def make_gyro(name, M_error_scale, b0_scale, sigma_w_deg, sigma_beta_deg):
     return Gyroscope(name, M, sigma_w_deg=sigma_w_deg, sigma_beta_deg=sigma_beta_deg, b0=b0)
 
 
-def main(run_mekf_studies=True, run_convergence_study=True, seed=16):
+def main(run_mekf_studies=True, seed=16):
     if seed is not None:
         np.random.seed(seed)
 
@@ -446,13 +456,21 @@ def main(run_mekf_studies=True, run_convergence_study=True, seed=16):
         hdot_cmd = np.clip(hdot_cmd, -rw_torque_limit, rw_torque_limit)
         return -hdot_cmd
 
-    def rk4_control_step(x, t_now, dt, tau_cmd, env):
-        x_next = rk4(
-            full_dyn_controlled,
-            x,
-            np.array([t_now, t_now + dt]),
-            args=(I_body, mu, surfaces, env, tau_cmd),
-        )[-1]
+    def rk4_control_step(x, t_now, dt, tau_cmd, env, tau_ext=None, m_cmd=None):
+        if m_cmd is not None:
+            x_next = rk4(
+                full_dyn_magnetic,
+                x,
+                np.array([t_now, t_now + dt]),
+                args=(I_body, mu, surfaces, env, tau_cmd, m_cmd),
+            )[-1]
+        else:
+            x_next = rk4(
+                full_dyn_controlled,
+                x,
+                np.array([t_now, t_now + dt]),
+                args=(I_body, mu, surfaces, env, tau_cmd, tau_ext),
+            )[-1]
         x_next[0:4] /= np.linalg.norm(x_next[0:4])
         return x_next
 
@@ -725,8 +743,7 @@ def main(run_mekf_studies=True, run_convergence_study=True, seed=16):
     reg_settle_idx = np.where(reg_compare_err < 1.0)[0]
     reg_settle_time = t_slew[reg_settle_idx[0]] if len(reg_settle_idx) > 0 else np.nan
     print(
-        f"180 deg comparison: eigen_axis_maneuver_time={slew_time:.1f}s, "
-        f"eigen_axis_max_tracking={np.max(slew_tracking_err):.4f} deg, "
+        f"180 deg comparison: eigen_axis_max_tracking={np.max(slew_tracking_err):.4f} deg, "
         f"regulator_1deg={reg_settle_time:.1f}s, "
         f"regulator_final_err={reg_compare_err[-1]:.4f} deg, "
         f"regulator_max_tau={np.max(np.abs(reg_compare_torque)):.2e} N m, "
@@ -750,6 +767,307 @@ def main(run_mekf_studies=True, run_convergence_study=True, seed=16):
         torque_limit=rw_torque_limit,
         momentum_limit=rw_momentum_limit,
     )
+
+    print("MTQ-only 3-axis attitude control (HW5 option 5)")
+    m_max_mtq = 0.2
+    omega_n_mtq = 2.0 * (2.0 * np.pi / T_orbit)
+    zeta_mtq = 2.0
+    I_diag = np.diag(I_body)
+    Kp_mtq = (omega_n_mtq ** 2) * I_diag
+    Kd_mtq = 2.0 * zeta_mtq * omega_n_mtq * I_diag
+    tau_des_limit_mtq = 4.0e-6
+    mtq_ctrl = MagneticProjectedTorqueController(
+        Kp=Kp_mtq, Kd=Kd_mtq, m_max=m_max_mtq, tau_des_limit=tau_des_limit_mtq,
+    )
+    print(
+        f"  PD gains (per-axis): Kp = {Kp_mtq} N m, Kd = {Kd_mtq} N m s; "
+        f"omega_n = {omega_n_mtq:.2e} rad/s (= 2.0 * omega_orb), zeta = {zeta_mtq}"
+    )
+    env_mtq = {"gravity_gradient": True, "drag": True, "rho": rho_500km, "cd": cd_drag}
+
+    def simulate_mtq_attitude(q0_true, omega0_true, q_des_traj, t_arr, env, ctrl,
+                              omega_des_traj=None):
+        x = np.concatenate((q0_true, omega0_true, np.zeros(3), r0, v0))
+        n = len(t_arr)
+        state_hist = np.zeros((n, len(x)))
+        moment_hist = np.zeros((n, 3))
+        B_hist = np.zeros((n, 3))
+        tau_des_hist = np.zeros((n, 3))
+        tau_actual_hist = np.zeros((n, 3))
+        parallel_loss = np.zeros(n)
+        proj_eff = np.zeros(n)
+        tracking_err_deg = np.zeros(n)
+        estimate_err_deg = np.zeros(n)
+        state_hist[0] = x
+
+        gyro_local = make_gyro("BMI160 Gyro", M_gyro_scale, gyro_b0_scale,
+                               sigma_w_deg=0.007, sigma_beta_deg=0.0005)
+        init_err_axis = np.array([1.0, -0.4, 0.2])
+        init_err_axis /= np.linalg.norm(init_err_axis)
+        init_err = expq(0.5 * np.radians(2.0) * init_err_axis)
+        q0_est = L_q(q0_true) @ init_err
+        q0_est /= np.linalg.norm(q0_est)
+        P0_ctrl = np.zeros((6, 6))
+        P0_ctrl[:3, :3] = np.radians(2.0) ** 2 * np.eye(3)
+        P0_ctrl[3:, 3:] = np.radians(0.5) ** 2 * np.eye(3)
+        filt = MEKF(q0_est, np.zeros(3), P0_ctrl, sigma_w, sigma_beta)
+
+        for k in range(n - 1):
+            dt_k = t_arr[k + 1] - t_arr[k]
+            q_true = x[0:4]
+            omega_true = x[4:7]
+            q_des_k = q_des_traj[k] if q_des_traj.ndim == 2 else q_des_traj
+            omega_des_k = (
+                omega_des_traj[k]
+                if omega_des_traj is not None and omega_des_traj.ndim == 2
+                else (np.zeros(3) if omega_des_traj is None else omega_des_traj)
+            )
+
+            gyro_meas = gyro_local.measure(omega_true, dt_k)
+            q_ctrl = filt.q
+            omega_ctrl = gyro_meas - filt.beta
+            estimate_err_deg[k] = attitude_error_deg(filt.q, q_true)
+
+            B_b_ctrl = B_body(q_ctrl, x[10:13], t_arr[k])
+            out = ctrl.step(q_ctrl, omega_ctrl, q_des_k, B_b_ctrl, omega_des_k)
+            m_cmd = out["m_cmd"]
+            moment_hist[k] = m_cmd
+            B_hist[k] = B_b_ctrl
+            tau_des_hist[k] = out["tau_des"]
+            tau_actual_hist[k] = out["tau_actual"]
+            parallel_loss[k] = out["parallel_loss_fraction"]
+            proj_eff[k] = out["projection_efficiency"]
+            tracking_err_deg[k] = attitude_error_deg(q_true, q_des_k)
+            x = rk4_control_step(x, t_arr[k], dt_k, np.zeros(3), env, m_cmd=m_cmd)
+            state_hist[k + 1] = x
+
+            filt.predict(gyro_meas, dt_k)
+            Rot = quaternion_to_matrix(x[0:4])
+            sun_body = Rot.T @ sun_eci
+            B_eci_ref = B_eci(x[10:13], t_arr[k + 1])
+            B_eci_hat = B_eci_ref / np.linalg.norm(B_eci_ref)
+            B_body_hat_truth = Rot.T @ B_eci_hat
+            filt.update_vector(ss.measure(sun_body), sun_eci, W_ss_eff)
+            filt.update_vector(mag.measure(B_body_hat_truth), B_eci_hat, W_mag_eff)
+            filt.update_star_tracker(st.measure(x[0:4]), st.W_st)
+            estimate_err_deg[k + 1] = attitude_error_deg(filt.q, x[0:4])
+
+        q_des_final = q_des_traj[-1] if q_des_traj.ndim == 2 else q_des_traj
+        B_hist[-1] = B_body(x[0:4], x[10:13], t_arr[-1])
+        tracking_err_deg[-1] = attitude_error_deg(x[0:4], q_des_final)
+        moment_hist[-1] = moment_hist[-2]
+        tau_des_hist[-1] = tau_des_hist[-2]
+        tau_actual_hist[-1] = tau_actual_hist[-2]
+        parallel_loss[-1] = parallel_loss[-2]
+        proj_eff[-1] = proj_eff[-2]
+        tau_lost_hist = tau_des_hist - tau_actual_hist
+        final_err_deg = np.array([
+            attitude_error_deg(q, q_des_final) for q in state_hist[:, 0:4]
+        ])
+        return {
+            "state": state_hist, "moment": moment_hist, "B_body": B_hist,
+            "tau_des": tau_des_hist, "tau_actual": tau_actual_hist,
+            "tau_lost": tau_lost_hist,
+            "tau_des_norm": np.linalg.norm(tau_des_hist, axis=1),
+            "tau_actual_norm": np.linalg.norm(tau_actual_hist, axis=1),
+            "tau_lost_norm": np.linalg.norm(tau_lost_hist, axis=1),
+            "parallel_loss_fraction": parallel_loss,
+            "projection_efficiency": proj_eff,
+            "att_err_deg": final_err_deg,
+            "tracking_err_deg": tracking_err_deg,
+            "estimate_err_deg": estimate_err_deg,
+        }
+
+    def simulate_rw_attitude(q0_true, omega0_true, q_des, t_arr, env, tvlqr):
+        x = np.concatenate((q0_true, omega0_true, np.zeros(3), r0, v0))
+        n = len(t_arr)
+        state_hist = np.zeros((n, len(x)))
+        torque_hist = np.zeros((n, 3))
+        att_err_deg = np.zeros(n)
+        estimate_err_deg = np.zeros(n)
+        state_hist[0] = x
+
+        gyro_local = make_gyro("BMI160 Gyro", M_gyro_scale, gyro_b0_scale,
+                               sigma_w_deg=0.007, sigma_beta_deg=0.0005)
+        init_err_axis = np.array([1.0, -0.4, 0.2])
+        init_err_axis /= np.linalg.norm(init_err_axis)
+        init_err = expq(0.5 * np.radians(2.0) * init_err_axis)
+        q0_est = L_q(q0_true) @ init_err
+        q0_est /= np.linalg.norm(q0_est)
+        P0_ctrl = np.zeros((6, 6))
+        P0_ctrl[:3, :3] = np.radians(2.0) ** 2 * np.eye(3)
+        P0_ctrl[3:, 3:] = np.radians(0.5) ** 2 * np.eye(3)
+        filt = MEKF(q0_est, np.zeros(3), P0_ctrl, sigma_w, sigma_beta)
+
+        for k in range(n - 1):
+            dt_k = t_arr[k + 1] - t_arr[k]
+            q_true = x[0:4]
+            omega_true = x[4:7]
+
+            gyro_meas = gyro_local.measure(omega_true, dt_k)
+            q_ctrl = filt.q
+            omega_ctrl = gyro_meas - filt.beta
+            estimate_err_deg[k] = attitude_error_deg(filt.q, q_true)
+
+            tau_des = tvlqr.torque(t_arr[k], q_ctrl, omega_ctrl)
+            tau_cmd = reaction_wheel_torque_command(tau_des, x[7:10], dt_k)
+            torque_hist[k] = tau_cmd
+            att_err_deg[k] = attitude_error_deg(q_true, q_des)
+            x = rk4_control_step(x, t_arr[k], dt_k, tau_cmd, env)
+            state_hist[k + 1] = x
+
+            filt.predict(gyro_meas, dt_k)
+            Rot = quaternion_to_matrix(x[0:4])
+            sun_body = Rot.T @ sun_eci
+            mag_body = Rot.T @ mag_eci
+            filt.update_vector(ss.measure(sun_body), sun_eci, W_ss_eff)
+            filt.update_vector(mag.measure(mag_body), mag_eci, W_mag_eff)
+            filt.update_star_tracker(st.measure(x[0:4]), st.W_st)
+            estimate_err_deg[k + 1] = attitude_error_deg(filt.q, x[0:4])
+
+        att_err_deg[-1] = attitude_error_deg(x[0:4], q_des)
+        torque_hist[-1] = torque_hist[-2]
+        return {
+            "state": state_hist, "torque": torque_hist,
+            "att_err_deg": att_err_deg, "estimate_err_deg": estimate_err_deg,
+        }
+
+    def first_crossing(t_arr, signal_deg, threshold):
+        idx = np.where(signal_deg < threshold)[0]
+        return float(t_arr[idx[0]]) if len(idx) > 0 else None
+
+    print("  Scenario 1: MTQ-only regulation, 30 deg initial error -> q_hold over 5 orbits")
+    reg_axis = np.array([0.3, 0.7, 0.6])
+    reg_axis = reg_axis / np.linalg.norm(reg_axis)
+    q0_reg = expq(0.5 * np.radians(30.0) * reg_axis)
+    omega0_reg = np.radians(np.array([0.05, -0.05, 0.05]))
+    n_orbits_reg = 5
+    dt_mtq = 1.0
+    t_mtq_reg = np.arange(0.0, n_orbits_reg * T_orbit + dt_mtq, dt_mtq)
+    q_des_reg = q_hold.copy()
+    mtq_reg = simulate_mtq_attitude(q0_reg, omega0_reg, q_des_reg, t_mtq_reg, env_mtq, mtq_ctrl)
+    t_rw_reg = np.arange(0.0, T_orbit + 0.5, 0.5)
+    rw_reg = simulate_rw_attitude(q0_reg, omega0_reg, q_des_reg, t_rw_reg, env_mtq, tvlqr_regulator)
+
+    slew_axis = np.array([1.0, 1.0, 0.5])
+    slew_axis = slew_axis / np.linalg.norm(slew_axis)
+    slew_angle_deg = 180.0
+    mtq_slew_time_orbits = 3.0
+    mtq_slew_time = mtq_slew_time_orbits * T_orbit
+    print(
+        f"  Scenario 2: MTQ-only scheduled slew, identity -> {slew_angle_deg:.0f} deg "
+        f"about [1,1,0.5], T={mtq_slew_time_orbits:.1f} orbits, simulated over 8 orbits"
+    )
+    q_final_slew = expq(0.5 * np.radians(slew_angle_deg) * slew_axis)
+    q0_slew_mtq = np.array([1.0, 0.0, 0.0, 0.0])
+    omega0_slew_mtq = np.zeros(3)
+    n_orbits_slew = 8
+    t_mtq_slew = np.arange(0.0, n_orbits_slew * T_orbit + dt_mtq, dt_mtq)
+    mtq_slew_ref = eigen_axis_slew_trajectory(
+        q0_slew_mtq, q_final_slew, t_mtq_slew, mtq_slew_time, I_body
+    )
+    mtq_slew = simulate_mtq_attitude(q0_slew_mtq, omega0_slew_mtq, mtq_slew_ref["q"],
+                                     t_mtq_slew, env_mtq, mtq_ctrl,
+                                     omega_des_traj=mtq_slew_ref["omega"])
+    mtq_slew["att_err_to_final_deg"] = mtq_slew["att_err_deg"]
+
+    n_orbits_cmp = 5
+    t_lqr_slew = np.arange(0.0, T_orbit + 0.5, 0.5)
+    tvlqr_to_qfinal = TVLQRAttitudeRegulator(
+        I_body, q_final_slew, t_lqr_slew, Q_lqr, R_lqr,
+        Qf=20.0 * Q_lqr, torque_limit=rw_torque_limit,
+    )
+    t_rw_cmp = np.arange(0.0, n_orbits_cmp * T_orbit + dt_mtq, dt_mtq)
+    rw_slew = simulate_rw_attitude(q0_slew_mtq, omega0_slew_mtq, q_final_slew,
+                                   t_rw_cmp, env_mtq, tvlqr_to_qfinal)
+
+    def summarize_run(name, t_arr, run, target_label):
+        err = run["att_err_deg"]
+        rms = float(np.sqrt(np.mean(err**2)))
+        t5 = first_crossing(t_arr, err, 5.0)
+        t1 = first_crossing(t_arr, err, 1.0)
+        print(
+            f"  {name}: init_err={err[0]:.2f} deg, final_err={err[-1]:.4f} deg, "
+            f"rms={rms:.3f} deg, t_to_5deg={'N/A' if t5 is None else f'{t5/T_orbit:.2f} orb'}, "
+            f"t_to_1deg={'N/A' if t1 is None else f'{t1/T_orbit:.2f} orb'} (target = {target_label})"
+        )
+        return {
+            "init_err": float(err[0]), "final_err": float(err[-1]),
+            "rms_err": rms,
+            "t_to_5deg_s": t5, "t_to_1deg_s": t1,
+            "t_to_5deg_orbits": (None if t5 is None else t5 / T_orbit),
+            "t_to_1deg_orbits": (None if t1 is None else t1 / T_orbit),
+        }
+
+    mtq_reg_summary  = summarize_run("MTQ-only regulation", t_mtq_reg,  mtq_reg,  "q_hold")
+    rw_reg_summary   = summarize_run("RW   regulation",     t_rw_reg,   rw_reg,   "q_hold")
+    mtq_slew_summary = summarize_run("MTQ-only slew",       t_mtq_slew, mtq_slew, f"{slew_angle_deg:.0f} deg")
+    rw_slew_summary  = summarize_run("RW   slew",           t_rw_cmp,   rw_slew,  f"{slew_angle_deg:.0f} deg")
+
+    n_mtq_cmp = int(np.searchsorted(t_mtq_slew, n_orbits_cmp * T_orbit, side='right'))
+    t_mtq_cmp = t_mtq_slew[:n_mtq_cmp]
+    mtq_slew_cmp = {"att_err_deg": mtq_slew["att_err_deg"][:n_mtq_cmp]}
+    mtq_slew_cmp_summary = summarize_run(
+        "MTQ-only slew (5-orbit cmp window)", t_mtq_cmp, mtq_slew_cmp,
+        f"{slew_angle_deg:.0f} deg",
+    )
+
+    m_reg_axis_peak = float(np.max(np.max(np.abs(mtq_reg["moment"]), axis=1)) / m_max_mtq)
+    m_reg_axis_mean = float(np.mean(np.max(np.abs(mtq_reg["moment"]), axis=1)) / m_max_mtq)
+    m_slew_axis_peak = float(np.max(np.max(np.abs(mtq_slew["moment"]), axis=1)) / m_max_mtq)
+    m_slew_axis_mean = float(np.mean(np.max(np.abs(mtq_slew["moment"]), axis=1)) / m_max_mtq)
+    rw_slew_peak_tau = float(np.max(np.abs(rw_slew["torque"])))
+    rw_slew_peak_h = float(np.max(np.linalg.norm(rw_slew["state"][:, 7:10], axis=1)))
+    proj_eff_reg_mean = float(np.mean(mtq_reg["projection_efficiency"]))
+    proj_eff_slew_mean = float(np.mean(mtq_slew["projection_efficiency"]))
+    parallel_loss_slew_mean = float(np.mean(mtq_slew["parallel_loss_fraction"]))
+    print(
+        f"  MTQ regulation: peak max_i|m_i|/m_max={m_reg_axis_peak:.3f}, "
+        f"mean={m_reg_axis_mean:.3f}, mean proj_eff={proj_eff_reg_mean:.2f}"
+    )
+    peak_omega_reg = float(np.max(np.linalg.norm(mtq_reg["state"][:, 4:7], axis=1)))
+    peak_omega_slew = float(np.max(np.linalg.norm(mtq_slew["state"][:, 4:7], axis=1)))
+    print(
+        f"  MTQ slew: peak max_i|m_i|/m_max={m_slew_axis_peak:.3f}, "
+        f"mean={m_slew_axis_mean:.3f}, mean proj_eff={proj_eff_slew_mean:.2f}, "
+        f"mean parallel_loss={parallel_loss_slew_mean:.2f}"
+    )
+    print(
+        f"  RW slew comparison effort: peak max_i|tau_i|={rw_slew_peak_tau:.2e} N m, "
+        f"peak ||h_RW||={rw_slew_peak_h:.2e} N m s"
+    )
+    print(
+        f"  Peak ||omega||: regulation={np.degrees(peak_omega_reg):.3f} deg/s, "
+        f"slew={np.degrees(peak_omega_slew):.3f} deg/s"
+    )
+
+    slew_diag = {
+        "att_err_to_final_deg": mtq_slew["att_err_deg"],
+        "tau_des_norm": mtq_slew["tau_des_norm"],
+        "tau_actual_norm": mtq_slew["tau_actual_norm"],
+        "tau_lost_norm": mtq_slew["tau_lost_norm"],
+    }
+    plot_mtq_only_slew(
+        t_mtq_slew, T_orbit, mtq_slew["state"], mtq_slew["moment"], slew_diag,
+        m_max=m_max_mtq, basename="mtq_only_slew.png",
+        commanded_angle_deg=slew_angle_deg,
+        title_suffix=(
+            f" ({slew_angle_deg:.0f}\u00b0 about [1,1,0.5], "
+            f"T={mtq_slew_time_orbits:.0f} orbits, 8-orbit sim, GG + drag)"
+        ),
+    )
+
+    rw_cmp = {
+        "label": "RW (TVLQR)",
+        "t": t_rw_cmp,
+        "att_err_deg": rw_slew["att_err_deg"],
+    }
+    mtq_cmp = {
+        "label": "MTQ-only (projected)",
+        "t": t_mtq_cmp,
+        "att_err_deg": mtq_slew_cmp["att_err_deg"],
+    }
+    plot_rw_vs_mtq_control(T_orbit, rw_cmp, mtq_cmp, "rw_vs_mtq_control.png")
 
     T_sim_mekf = 120.0
     dt_high = 0.01
