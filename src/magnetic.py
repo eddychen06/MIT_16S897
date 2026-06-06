@@ -1,11 +1,9 @@
 import numpy as np
 from src.dynamics import quaternion_to_matrix, full_dyn_controlled
 
-# L14 p.1: Earth's field as a tilted dipole, m_hat fixed in ECEF.
-# B(r) = (mu_0 m_E) / (4 pi r^3) * (3 (m_hat . r_hat) r_hat - m_hat)
 MU_0 = 4.0 * np.pi * 1e-7
 M_EARTH = 7.94e22
-TILT_DEG = 11.0  # L14 p.1: "Tilt is ~11 deg"
+TILT_DEG = 11.0  
 OMEGA_EARTH = 7.2921159e-5
 
 
@@ -31,8 +29,6 @@ def B_body(q, r_eci_km, t):
 
 
 def full_dyn_magnetic(t, x, J, mu, surfaces, env, tau_cmd, m_cmd):
-    # Sample-hold m_cmd over the control interval, but recompute B_body(q, r, t)
-    # at each RK4 substep so the magnetic torque tracks the evolving state.
     B_b = B_body(x[0:4], x[10:13], t)
     tau_mag = np.cross(m_cmd, B_b)
     return full_dyn_controlled(t, x, J, mu, surfaces, env, tau_cmd, tau_ext=tau_mag)
